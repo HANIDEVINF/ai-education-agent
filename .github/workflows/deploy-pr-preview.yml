@@ -1,0 +1,339 @@
+name: PREVIEW PR - Deploy
+
+env:
+  HUSKY: 0
+  DOCKER_BUILDKIT: 1
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    paths:
+      - apps/api/**
+      - apps/web/**
+      - .github/workflows/deploy-pr-preview.yml
+      - docker-compose.preview.tpl.yml
+
+concurrency:
+  group: pr-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  deploy-pr-preview:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Uncloud CLI
+        run: |
+          curl -fsS https://get.uncloud.run/install.sh | sh
+          uc --version
+
+      - name: Setup SSH
+        shell: bash
+        env:
+          UNCLOUD_HOST: ${{ secrets.UNCLOUD_HOST }}
+          UNCLOUD_USER: ${{ secrets.UNCLOUD_USER }}
+          UNCLOUD_PORT: ${{ secrets.UNCLOUD_PORT }}
+          UNCLOUD_SSH_KEY: ${{ secrets.UNCLOUD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          for required in UNCLOUD_HOST UNCLOUD_USER UNCLOUD_PORT UNCLOUD_SSH_KEY; do
+            if [ -z "${!required:-}" ]; then
+              echo "Missing required secret: ${required}"
+              exit 1
+            fi
+          done
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          echo "${{ secrets.UNCLOUD_SSH_KEY }}" > ~/.ssh/id_ecdsa
+          chmod 600 ~/.ssh/id_ecdsa
+
+      - name: Configure SSH multiplexing
+        shell: bash
+        env:
+          UNCLOUD_HOST: ${{ secrets.UNCLOUD_HOST }}
+          UNCLOUD_USER: ${{ secrets.UNCLOUD_USER }}
+          UNCLOUD_PORT: ${{ secrets.UNCLOUD_PORT }}
+        run: |
+          set -euo pipefail
+
+          cat > ~/.ssh/config <<EOF
+          Host uncloud-host
+            HostName ${UNCLOUD_HOST}
+            User ${UNCLOUD_USER}
+            Port ${UNCLOUD_PORT}
+            IdentityFile ~/.ssh/id_ecdsa
+            StrictHostKeyChecking no
+            ControlMaster auto
+            ControlPersist 15m
+            ControlPath ~/.ssh/control-%r@%h:%p
+          EOF
+          chmod 600 ~/.ssh/config
+
+          echo "::add-mask::$UNCLOUD_HOST"
+          echo "::add-mask::$UNCLOUD_USER"
+          echo "::add-mask::$UNCLOUD_PORT"
+
+          ssh -o BatchMode=yes uncloud-host true
+
+          uc ls --connect "ssh+cli://uncloud-host" > /dev/null 2>&1
+
+          if [ $? -ne 0 ]; then
+            echo "Failed to connect to server"
+            exit 1
+          fi
+
+      - name: Render Compose for PR
+        shell: bash
+        env:
+          PR_ID: ${{ github.event.pull_request.number }}
+          UNCLOUD_PREVIEW_DOMAIN: ${{ vars.UNCLOUD_PREVIEW_DOMAIN }}
+        run: |
+          set -euo pipefail
+
+          RUSTFS_SECRET_KEY=miniopass
+          JWT_SECRET=jwtsecret
+          JWT_REFRESH_SECRET=jwtrefreshsecret
+          POSTGRES_PASSWORD=guidebook
+          PREVIEW_MAILHOG_DOMAIN="mailhog-pr-${PR_ID}.${UNCLOUD_PREVIEW_DOMAIN}"
+          PREVIEW_WEB_DOMAIN="pr-${PR_ID}.${UNCLOUD_PREVIEW_DOMAIN}"
+          PREVIEW_API_DOMAIN="api-pr-${PR_ID}.${UNCLOUD_PREVIEW_DOMAIN}"
+          PREVIEW_RUSTFS_DOMAIN="rustfs-pr-${PR_ID}.${UNCLOUD_PREVIEW_DOMAIN}"
+          GIT_DATE=$(git show -s --format=%cd --date=format:'%Y%m%d-%H%M%S' "$GITHUB_SHA")
+          GIT_SHA_SHORT=$(echo "$GITHUB_SHA" | cut -c1-7)
+          VERSION_TAG="${GIT_DATE}.${GIT_SHA_SHORT}"
+
+          export VERSION_TAG PR_ID PREVIEW_WEB_DOMAIN PREVIEW_API_DOMAIN PREVIEW_MAILHOG_DOMAIN PREVIEW_RUSTFS_DOMAIN RUSTFS_SECRET_KEY JWT_SECRET JWT_REFRESH_SECRET POSTGRES_PASSWORD
+          envsubst '${VERSION_TAG} ${PR_ID} ${PREVIEW_WEB_DOMAIN} ${PREVIEW_API_DOMAIN} ${PREVIEW_MAILHOG_DOMAIN} ${PREVIEW_RUSTFS_DOMAIN} ${RUSTFS_SECRET_KEY} ${JWT_SECRET} ${JWT_REFRESH_SECRET} ${POSTGRES_PASSWORD}' < "docker-compose.preview.tpl.yml" > "docker-compose.pr.yml"
+
+      - name: Create helpers to repair invalid stack building
+        env:
+          PR_ID: ${{ github.event.pull_request.number }}
+          UNCLOUD_PREVIEW_DOMAIN: ${{ vars.UNCLOUD_PREVIEW_DOMAIN }}
+        run: |
+          set -euo pipefail
+
+          echo "VITE_API_URL=https://api-pr-${PR_ID}.${UNCLOUD_PREVIEW_DOMAIN}" > apps/web/.env
+          echo "VITE_APP_URL=https://pr-${PR_ID}.${UNCLOUD_PREVIEW_DOMAIN}" >> apps/web/.env
+
+      - name: Deploy PR Preview stack
+        env:
+          PR_ID: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          MASTER_KEY=$(echo -n "preview-pr-${PR_ID}" | openssl dgst -sha256 -binary | head -c 32 | openssl base64)
+          export MASTER_KEY
+
+          uc --connect "ssh+cli://uncloud-host" deploy -f docker-compose.pr.yml -y
+
+      - name: Reset database (drop + recreate)
+        env:
+          PR_ID: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          uc --connect "ssh+cli://uncloud-host" exec db-preview-pr-${PR_ID} psql -v ON_ERROR_STOP=1 -U postgres -d postgres \
+            -c "REVOKE CONNECT ON DATABASE guidebook FROM public;" \
+            -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'guidebook' AND pid <> pg_backend_pid();" \
+            -c "DROP DATABASE IF EXISTS guidebook;" \
+            -c "CREATE DATABASE guidebook;" \
+            -c "GRANT ALL PRIVILEGES ON DATABASE guidebook TO postgres;" \
+            -c "GRANT CONNECT ON DATABASE guidebook TO public;"
+
+      - name: Seed database
+        continue-on-error: true
+        env:
+          PR_ID: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          for attempt in 1 2 3 4 5; do
+            if uc --connect "ssh+cli://uncloud-host" exec api-preview-pr-${PR_ID} npm i -g tsx drizzle-kit drizzle-orm && \
+              uc --connect "ssh+cli://uncloud-host" exec api-preview-pr-${PR_ID} npm run db:seed; then
+              exit 0
+            fi
+
+            echo "Seed attempt ${attempt} failed; retrying..."
+            sleep 10
+          done
+
+          echo "Seed step skipped after repeated failures"
+          exit 0
+
+      - name: Comment PR - send message to PR preview link
+        env:
+          PR_ID: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UNCLOUD_PREVIEW_DOMAIN: ${{ vars.UNCLOUD_PREVIEW_DOMAIN }}
+        run: |
+          set -euo pipefail
+
+          PREVIEW_WEB_DOMAIN="https://pr-${PR_ID}.${UNCLOUD_PREVIEW_DOMAIN}"
+          PREVIEW_MAILHOG_DOMAIN="https://mailhog-pr-${PR_ID}.${UNCLOUD_PREVIEW_DOMAIN}"
+
+          comments=$(curl -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/issues/${PR_ID}/comments")
+          already_exists=$(echo "$comments" | jq -r '
+            any(.[];
+              ((.user.type == "Bot") or (.user.login == "github-actions[bot]"))
+              and
+              (.body | test("preview ready"; "i"))
+            )
+          ')
+
+          if [[ "$already_exists" == "true" ]]; then
+            echo "Preview comment already exists - skipping"
+            exit 0
+          fi
+
+          message=$(cat <<EOF
+          🚀 Preview ready
+          ---
+          Mails do not leave the preview environment. Database has been seeded with test data.  You can access the preview at the following URLs:
+
+          List of available services:
+          | Service         | URL                           |
+          | --------------- | ----------------------------- |
+          | Web             | ${PREVIEW_WEB_DOMAIN}         |
+          | Mailhog         | ${PREVIEW_MAILHOG_DOMAIN}     |
+
+          List of available accounts:
+          | Role            | Email                         | Password   |
+          | --------------- | ----------------------------- | ---------- |
+          | Student         | \`student@example.com\`         | \`password\` |
+          | Student         | \`student0@example.com\`        | \`password\` |
+          | Student         | \`student2@example.com\`        | \`password\` |
+          | Content Creator | \`contentcreator@example.com\`  | \`password\` |
+          | Content Creator | \`contentcreator2@example.com\` | \`password\` |
+          | Admin           | \`admin@example.com\`           | \`password\` |
+          EOF)
+
+          body=$(jq -n --arg message "$message" '{body: $message}')
+
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/vnd.github+json" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/issues/${PR_ID}/comments" \
+            -d "$body"
+
+  cleanup-pr-preview:
+    if: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Uncloud CLI
+        run: |
+          curl -fsS https://get.uncloud.run/install.sh | sh
+          uc --version
+
+      - name: Setup SSH
+        shell: bash
+        env:
+          UNCLOUD_HOST: ${{ secrets.UNCLOUD_HOST }}
+          UNCLOUD_USER: ${{ secrets.UNCLOUD_USER }}
+          UNCLOUD_PORT: ${{ secrets.UNCLOUD_PORT }}
+          UNCLOUD_SSH_KEY: ${{ secrets.UNCLOUD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          for required in UNCLOUD_HOST UNCLOUD_USER UNCLOUD_PORT UNCLOUD_SSH_KEY; do
+            if [ -z "${!required:-}" ]; then
+              echo "Missing required secret: ${required}"
+              exit 1
+            fi
+          done
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          echo "${{ secrets.UNCLOUD_SSH_KEY }}" > ~/.ssh/id_ecdsa
+          chmod 600 ~/.ssh/id_ecdsa
+
+      - name: Configure SSH multiplexing
+        shell: bash
+        env:
+          UNCLOUD_HOST: ${{ secrets.UNCLOUD_HOST }}
+          UNCLOUD_USER: ${{ secrets.UNCLOUD_USER }}
+          UNCLOUD_PORT: ${{ secrets.UNCLOUD_PORT }}
+        run: |
+          set -euo pipefail
+
+          cat > ~/.ssh/config <<EOF
+          Host uncloud-host
+            HostName ${UNCLOUD_HOST}
+            User ${UNCLOUD_USER}
+            Port ${UNCLOUD_PORT}
+            IdentityFile ~/.ssh/id_ecdsa
+            StrictHostKeyChecking no
+            ControlMaster auto
+            ControlPersist 15m
+            ControlPath ~/.ssh/control-%r@%h:%p
+          EOF
+          chmod 600 ~/.ssh/config
+
+          echo "::add-mask::$UNCLOUD_HOST"
+          echo "::add-mask::$UNCLOUD_USER"
+          echo "::add-mask::$UNCLOUD_PORT"
+
+          ssh -o BatchMode=yes uncloud-host true
+
+          uc ls --connect "ssh+cli://uncloud-host" > /dev/null 2>&1
+
+          if [ $? -ne 0 ]; then
+            echo "Failed to connect to server"
+            exit 1
+          fi
+
+      - name: Cleanup PR Preview stack
+        env:
+          PR_ID: ${{ github.event.pull_request.number }}
+          UNCLOUD_PREVIEW_DOMAIN: ${{ vars.UNCLOUD_PREVIEW_DOMAIN }}
+        run: |
+          set -euo pipefail
+
+          RUSTFS_SECRET_KEY=""
+          JWT_SECRET=""
+          JWT_REFRESH_SECRET=""
+          POSTGRES_PASSWORD=""
+          PREVIEW_MAILHOG_DOMAIN="mailhog-pr-${PR_ID}.${UNCLOUD_PREVIEW_DOMAIN}"
+          PREVIEW_WEB_DOMAIN="pr-${PR_ID}.${UNCLOUD_PREVIEW_DOMAIN}"
+          PREVIEW_API_DOMAIN="api-pr-${PR_ID}.${UNCLOUD_PREVIEW_DOMAIN}"
+          PREVIEW_RUSTFS_DOMAIN="rustfs-pr-${PR_ID}.${UNCLOUD_PREVIEW_DOMAIN}"
+          VERSION_TAG="0"
+
+          export VERSION_TAG PR_ID PREVIEW_WEB_DOMAIN PREVIEW_API_DOMAIN PREVIEW_MAILHOG_DOMAIN PREVIEW_RUSTFS_DOMAIN RUSTFS_SECRET_KEY JWT_SECRET JWT_REFRESH_SECRET POSTGRES_PASSWORD
+          envsubst '${VERSION_TAG} ${PR_ID} ${PREVIEW_WEB_DOMAIN} ${PREVIEW_API_DOMAIN} ${PREVIEW_MAILHOG_DOMAIN} ${PREVIEW_RUSTFS_DOMAIN} ${RUSTFS_SECRET_KEY} ${JWT_SECRET} ${JWT_REFRESH_SECRET} ${POSTGRES_PASSWORD}' < "docker-compose.preview.tpl.yml" > "docker-compose.pr.yml"
+
+          services="$(yq -r '.services | keys | .[]' docker-compose.pr.yml)"
+          volumes="$(yq -r '.volumes | keys | .[]' docker-compose.pr.yml)"
+
+          echo "$services" | xargs -r uc --connect "ssh+cli://uncloud-host" rm || true
+          echo "$volumes" | xargs -r uc --connect "ssh+cli://uncloud-host" volume rm -y || true
+
+      - name: Prune unused Docker images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh uncloud-host "docker image prune -f -a"

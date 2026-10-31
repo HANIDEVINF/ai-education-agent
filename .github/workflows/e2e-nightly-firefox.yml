@@ -1,0 +1,23 @@
+name: Nightly Firefox E2E
+
+env:
+  HUSKY: 0
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    uses: ./.github/workflows/e2e.yml
+    with:
+      browser: firefox
+    secrets:
+      STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+      STRIPE_PUBLISHABLE_KEY: ${{ secrets.STRIPE_PUBLISHABLE_KEY }}
+      STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+      MASTER_KEY: ${{ secrets.MASTER_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      LUMA_API_KEY: ${{ secrets.LUMA_API_KEY }}
+      LUMA_BASE_URL: ${{ secrets.LUMA_BASE_URL }}

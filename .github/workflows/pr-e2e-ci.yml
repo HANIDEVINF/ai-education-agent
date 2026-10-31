@@ -1,0 +1,19 @@
+on:
+  pull_request:
+    types: [labeled]
+  workflow_call:
+
+jobs:
+  e2e:
+    if: ${{ (github.event_name == 'pull_request' && github.event.label != null && github.event.label.name == 'run E2E tests ⚙️') || github.event_name == 'workflow_call' }}
+    uses: ./.github/workflows/e2e.yml
+    with:
+      browser: chromium
+    secrets:
+      STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+      STRIPE_PUBLISHABLE_KEY: ${{ secrets.STRIPE_PUBLISHABLE_KEY }}
+      STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+      MASTER_KEY: ${{ secrets.MASTER_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      LUMA_API_KEY: ${{ secrets.LUMA_API_KEY }}
+      LUMA_BASE_URL: ${{ secrets.LUMA_BASE_URL }}

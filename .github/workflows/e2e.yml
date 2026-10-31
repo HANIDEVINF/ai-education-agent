@@ -1,0 +1,246 @@
+name: E2E Tests
+
+env:
+  HUSKY: 0
+  JWT_SECRET: "test_secret"
+  JWT_REFRESH_SECRET: "test_refresh"
+  JWT_EXPIRATION_TIME: "15min"
+  CORS_ORIGIN: "https://localhost:5173"
+  EMAIL_ADAPTER: "mailhog"
+  DATABASE_URL: "postgresql://test_user:test_password@localhost:54321/test_db"
+  REDIS_URL: "redis://localhost:6380"
+  SMTP_HOST: "localhost"
+  SMTP_PORT: "1025"
+  SMTP_USER: ""
+  SMTP_PASSWORD: ""
+  AWS_REGION: "us-east-1"
+  AWS_ACCESS_KEY_ID: "rustfsadmin"
+  AWS_SECRET_ACCESS_KEY: "rustfsadmin"
+  AWS_BUCKET_NAME: "test-bucket"
+  AWS_ENDPOINT_URL: "http://localhost:9100"
+  SMTP_EMAIL_FROM: "noreply@lms.selleo.app"
+  SEED_MANAGE_DB_ROLE: "true"
+
+on:
+  workflow_call:
+    inputs:
+      browser:
+        description: Playwright project to run
+        required: false
+        type: string
+        default: all
+    secrets:
+        STRIPE_SECRET_KEY:
+          required: true
+        STRIPE_PUBLISHABLE_KEY:
+          required: true
+        STRIPE_WEBHOOK_SECRET:
+          required: true
+        MASTER_KEY:
+          required: true
+        OPENAI_API_KEY:
+          required: true
+        LUMA_API_KEY:
+          required: false
+        LUMA_BASE_URL:
+          required: false
+  push:
+    branches:
+      - main
+      - staging
+
+jobs:
+  playwright:
+    name: Playwright Tests (shard ${{ matrix.shard }}/7)
+    runs-on: ubuntu-latest
+    environment:
+      name: e2e
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6,7]
+    env:
+      E2E_BROWSER: ${{ github.event_name == 'push' && 'chromium' || (inputs.browser || 'all') }}
+      PLAYWRIGHT_SHARD: ${{ matrix.shard }}
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
+        ports:
+          - 54321:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      mailhog:
+        image: mailhog/mailhog:v1.0.1
+        ports:
+          - 1025:1025
+          - 8025:8025
+        options: >-
+          --health-cmd "nc -z localhost 1025"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Caddy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y caddy
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.22.0
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.15.0
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build packages
+        run: pnpm -w packages:build
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright
+          restore-keys: |
+            ${{ runner.os }}-playwright
+
+      - name: Install Playwright browsers
+        shell: bash
+        run: |
+          case "$E2E_BROWSER" in
+            chromium)
+              pnpm exec playwright install --with-deps chromium
+              ;;
+            firefox)
+              pnpm exec playwright install --with-deps firefox
+              ;;
+            all)
+              pnpm exec playwright install --with-deps chromium firefox
+              ;;
+            *)
+              echo "Unsupported E2E_BROWSER value: $E2E_BROWSER" >&2
+              exit 1
+              ;;
+          esac
+        working-directory: ./apps/web
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+
+      - name: Start RustFS
+        run: |
+          docker run -d --name rustfs \
+            -p 9100:9000 \
+            -e RUSTFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" \
+            -e RUSTFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
+            rustfs/rustfs:latest /data
+
+          for i in {1..30}; do
+            if curl -fsS http://localhost:9100/health/ready >/dev/null; then
+              echo "RustFS is ready"
+              break
+            fi
+            if ! docker ps --format '{{.Names}}' | grep -qx rustfs; then
+              docker logs rustfs || true
+              exit 1
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:9100/health/ready >/dev/null || { docker logs rustfs; exit 1; }
+
+      - name: Setup RustFS bucket
+        run: |
+          docker run --rm \
+            --network host \
+            --entrypoint /bin/sh \
+            -e S3_ENDPOINT="$AWS_ENDPOINT_URL" \
+            -e S3_BUCKET_NAME="$AWS_BUCKET_NAME" \
+            -e S3_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+            -e S3_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+            -e S3_REGION="$AWS_REGION" \
+            -e S3_CONFIGURE_CORS=true \
+            -v "$PWD/create-rustfs-bucket.sh:/create-rustfs-bucket.sh:ro" \
+            amazon/aws-cli:latest /create-rustfs-bucket.sh
+
+      - name: Run tests
+        shell: bash
+        run: |
+          case "$E2E_BROWSER" in
+            chromium)
+              VITE_TEST=true pnpm playwright test --project chromium --shard="${PLAYWRIGHT_SHARD}/7"
+              ;;
+            firefox)
+              VITE_TEST=true pnpm playwright test --project firefox --shard="${PLAYWRIGHT_SHARD}/7"
+              ;;
+            all)
+              VITE_TEST=true pnpm playwright test --shard="${PLAYWRIGHT_SHARD}/7"
+              ;;
+            *)
+              echo "Unsupported E2E_BROWSER value: $E2E_BROWSER" >&2
+              exit 1
+              ;;
+          esac
+        working-directory: ./apps/web
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+          DATABASE_URL: postgresql://test_user:test_password@localhost:54321/test_db
+          REDIS_URL: "redis://localhost:6380"
+          NODE_ENV: test
+          API_URL: http://localhost:3000
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          STRIPE_PUBLISHABLE_KEY: ${{ secrets.STRIPE_PUBLISHABLE_KEY }}
+          STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+          MASTER_KEY: ${{ secrets.MASTER_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LUMA_API_KEY: ${{ secrets.LUMA_API_KEY }}
+          LUMA_BASE_URL: ${{ secrets.LUMA_BASE_URL }}
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts-shard-${{ matrix.shard }}
+          path: |
+            playwright-report
+            test-results
+            **/*.zip
+          retention-days: 3
+
+      - name: Stop RustFS
+        if: always()
+        run: docker rm -f rustfs || true

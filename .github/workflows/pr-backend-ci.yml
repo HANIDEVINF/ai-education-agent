@@ -1,0 +1,332 @@
+name: Backend Pull Request Check
+
+env:
+  HUSKY: 0
+  # environment variables for testing
+  JWT_SECRET: "test_secret"
+  JWT_REFRESH_SECRET: "test_refresh"
+  JWT_EXPIRATION_TIME: "24h"
+  CORS_ORIGIN: ""
+  EMAIL_ADAPTER: "mailhog"
+  DATABASE_URL: "postgresql://postgres:guidebook@localhost:5432/guidebook"
+  DATABASE_TEST_URL: "postgresql://postgres:guidebook@localhost:5432/guidebook_test"
+  REDIS_URL: "redis://localhost:6379/0"
+  REDIS_TEST_URL: "redis://localhost:6379/1"
+  SMTP_HOST: ""
+  SMTP_PORT: "1025"
+  SMTP_USER: ""
+  SMTP_PASSWORD: ""
+
+  SMTP_EMAIL_FROM: "noreply@lms.selleo.app"
+  STRIPE_SECRET_KEY: "test_secret"
+  STRIPE_PUBLISHABLE_KEY: "test_secret"
+  STRIPE_WEBHOOK_SECRET: "test_secret"
+  GOOGLE_OAUTH_ENABLED: "false"
+  MICROSOFT_OAUTH_ENABLED: "false"
+  SLACK_OAUTH_ENABLED: "false"
+  MASTER_KEY: "+iFu6dFP3uc8WFAB22Ebhh9GJjnmrv/bLxOv3L/n3zw=" # openssl rand --base64 32
+  AWS_REGION: "us-east-1"
+  AWS_ACCESS_KEY_ID: "rustfsadmin"
+  AWS_SECRET_ACCESS_KEY: "rustfsadmin"
+  AWS_BUCKET_NAME: "test-bucket"
+  AWS_ENDPOINT_URL: "http://localhost:9100"
+
+  PUPPETEER_EXECUTABLE_PATH: "/usr/bin/google-chrome"
+
+on:
+  pull_request:
+    branches:
+      - "*"
+    paths:
+      - apps/api/**
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.15.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build packages
+        run: pnpm -w packages:build
+
+      - name: Run ESLint
+        run: pnpm --filter=api lint-tsc
+
+  build:
+    name: Build app
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: guidebook
+          POSTGRES_DB: guidebook
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    defaults:
+      run:
+        working-directory: ./apps/api/
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: browser-actions/setup-chrome@v1
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.15.0
+          cache: pnpm
+
+      - run: pnpm install
+      - name: Build packages
+        run: pnpm -w packages:build
+
+      - name: Build the app
+        run: pnpm run build
+
+      - name: Verify Workflow PostgreSQL migrations
+        env:
+          NODE_OPTIONS: --experimental-vm-modules
+        run: pnpm exec jest --config ./test/jest-workflow-postgres.json --runInBand
+
+      - name: Apply database migrations
+        run: pnpm db:migrate
+
+      - name: Verify build output
+        env:
+          NODE_ENV: production
+          DISABLE_OUTBOX_PROCESSING: "true"
+        run: |
+          pnpm start:prod &
+          APP_PID=$!
+
+          attempt=1
+          max_attempts=20
+
+          until curl -sf http://localhost:3000/api/healthcheck >/dev/null 2>&1; do
+            if [ $attempt -ge $max_attempts ]; then
+              echo "Server failed to start"
+              kill $APP_PID || true
+              exit 1
+            fi
+
+            sleep 3
+
+            attempt=$((attempt + 1))
+          done
+
+          echo "Healthcheck passed"
+          kill $APP_PID || true
+
+  unit:
+    name: Jest unit tests (shard ${{ matrix.shard }}/2)
+    needs: [lint, build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: guidebook
+          POSTGRES_DB: guidebook
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+
+      - name: Start RustFS
+        run: |
+          docker run -d --name rustfs \
+            -p 9100:9000 \
+            -e RUSTFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" \
+            -e RUSTFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
+            rustfs/rustfs:latest /data
+
+          for i in {1..30}; do
+            if curl -fsS http://localhost:9100/health/ready >/dev/null; then
+              echo "RustFS is ready"
+              break
+            fi
+            if ! docker ps --format '{{.Names}}' | grep -qx rustfs; then
+              docker logs rustfs || true
+              exit 1
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:9100/health/ready >/dev/null || { docker logs rustfs; exit 1; }
+
+      - name: Setup RustFS bucket
+        run: |
+          docker run --rm \
+            --network host \
+            --entrypoint /bin/sh \
+            -e S3_ENDPOINT="$AWS_ENDPOINT_URL" \
+            -e S3_BUCKET_NAME="$AWS_BUCKET_NAME" \
+            -e S3_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+            -e S3_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+            -e S3_REGION="$AWS_REGION" \
+            -e S3_CONFIGURE_CORS=true \
+            -v "$PWD/create-rustfs-bucket.sh:/create-rustfs-bucket.sh:ro" \
+            amazon/aws-cli:latest /create-rustfs-bucket.sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.15.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build packages
+        run: pnpm -w packages:build
+
+      - name: Run unit tests
+        run: pnpm --filter=api test:ci --shard=${{ matrix.shard }}/2
+
+      - name: Stop RustFS
+        if: always()
+        run: docker rm -f rustfs || true
+
+  e2e:
+    name: Backend E2E (shard ${{ matrix.shard }}/8)
+    needs: [lint, build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: guidebook
+          POSTGRES_DB: guidebook
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+
+      - name: Start RustFS
+        run: |
+          docker run -d --name rustfs \
+            -p 9100:9000 \
+            -e RUSTFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" \
+            -e RUSTFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
+            rustfs/rustfs:latest /data
+
+          for i in {1..30}; do
+            if curl -fsS http://localhost:9100/health/ready >/dev/null; then
+              echo "RustFS is ready"
+              break
+            fi
+            if ! docker ps --format '{{.Names}}' | grep -qx rustfs; then
+              docker logs rustfs || true
+              exit 1
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:9100/health/ready >/dev/null || { docker logs rustfs; exit 1; }
+
+      - name: Setup RustFS bucket
+        run: |
+          docker run --rm \
+            --network host \
+            --entrypoint /bin/sh \
+            -e S3_ENDPOINT="$AWS_ENDPOINT_URL" \
+            -e S3_BUCKET_NAME="$AWS_BUCKET_NAME" \
+            -e S3_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+            -e S3_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+            -e S3_REGION="$AWS_REGION" \
+            -e S3_CONFIGURE_CORS=true \
+            -v "$PWD/create-rustfs-bucket.sh:/create-rustfs-bucket.sh:ro" \
+            amazon/aws-cli:latest /create-rustfs-bucket.sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.15.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build packages
+        run: pnpm -w packages:build
+
+      - name: Run E2E tests
+        env:
+          NODE_OPTIONS: --experimental-vm-modules
+        run: pnpm --filter=api exec jest --config ./test/jest-e2e.json --shard=${{ matrix.shard }}/8
+
+      - name: Stop RustFS
+        if: always()
+        run: docker rm -f rustfs || true
